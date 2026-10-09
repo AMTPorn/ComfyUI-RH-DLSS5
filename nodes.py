@@ -728,6 +728,24 @@ def _run_frames_stream(reader, fps, params: dict, backend_name: str, source_vide
     """
     from .dlss5nr.videoout import StreamEncoder, video_from_file
 
+    output_w, output_h = common.target_size(int(reader.width), int(reader.height), params["scale"])
+    encoder = StreamEncoder(output_w, output_h, fps, audio_input, source_video)
+    try:
+        input_w, input_h, output_w, output_h, order, engine = _stream_frames(
+            reader, params, backend_name, encoder.write)
+        encoder.close()
+    except BaseException:
+        encoder.abort()
+        raise
+    return (video_from_file(encoder.path), input_w, input_h, output_w, output_h, order, engine)
+
+
+def _stream_frames(reader, params: dict, backend_name: str, frame_sink):
+    """Push every frame of a sequential reader (width/height/count +
+    iter_frames() -> (index, uint8 RGB)) through the backend and hand each
+    uint8 RGB output frame to `frame_sink`. Shared by the VIDEO chunked path
+    and the VHS disk nodes; the caller owns the sink's lifecycle.
+    """
     input_w, input_h = int(reader.width), int(reader.height)
     output_w, output_h = common.target_size(input_w, input_h, params["scale"])
     params = dict(params)
@@ -738,29 +756,23 @@ def _run_frames_stream(reader, fps, params: dict, backend_name: str, source_vide
     ]
     backend = _load_backend(backend_name)
 
-    encoder = StreamEncoder(output_w, output_h, fps, audio_input, source_video)
     holder = _FrameHolder()
     progress = _progress_callback()
     selected_order = None
-    try:
-        for index, output in enumerate(backend.process_frames(
-            _frame_source_iter((f for _i, f in reader.iter_frames()), params, holder),
-            input_w, input_h, output_w, output_h, params, progress
-        )):
-            need_ref = selected_order is None and params["channel_order"] == "auto"
-            reference = (holder.current.astype(np.float32) / 255.0) if need_ref else output
-            corrected, order = _channel_choice(
-                output, reference,
-                params["channel_order"] if selected_order is None else selected_order
-            )
-            selected_order = order
-            corrected = np.clip(corrected, 0.0, 1.0)
-            encoder.write(np.ascontiguousarray(corrected * 255.0).round().astype(np.uint8))
-        encoder.close()
-    except BaseException:
-        encoder.abort()
-        raise
-    return (video_from_file(encoder.path), input_w, input_h, output_w, output_h,
+    for index, output in enumerate(backend.process_frames(
+        _frame_source_iter((f for _i, f in reader.iter_frames()), params, holder),
+        input_w, input_h, output_w, output_h, params, progress
+    )):
+        need_ref = selected_order is None and params["channel_order"] == "auto"
+        reference = (holder.current.astype(np.float32) / 255.0) if need_ref else output
+        corrected, order = _channel_choice(
+            output, reference,
+            params["channel_order"] if selected_order is None else selected_order
+        )
+        selected_order = order
+        corrected = np.clip(corrected, 0.0, 1.0)
+        frame_sink(np.ascontiguousarray(corrected * 255.0).round().astype(np.uint8))
+    return (input_w, input_h, output_w, output_h,
             selected_order, params.get("motion_engine", "none"))
 
 
@@ -788,11 +800,17 @@ def _audio_source_path_of(video) -> Optional[str]:
     return None
 
 
+from .disk_nodes import RH_DLSS5EnhanceDisk, RH_DLSS5FrameInterpolationDisk  # noqa: E402
+
 NODE_CLASS_MAPPINGS = {
     "RH_DLSS5Enhance": RH_DLSS5Enhance,
     "RH_DLSS5FrameInterpolation": RH_DLSS5FrameInterpolation,
+    "RH_DLSS5EnhanceDisk": RH_DLSS5EnhanceDisk,
+    "RH_DLSS5FrameInterpolationDisk": RH_DLSS5FrameInterpolationDisk,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RH_DLSS5Enhance": "RH DLSS5 Enhance (NR / Upscale)",
     "RH_DLSS5FrameInterpolation": "RH DLSS5 Frame Interpolation",
+    "RH_DLSS5EnhanceDisk": "RH DLSS5 Enhance (Disk)",
+    "RH_DLSS5FrameInterpolationDisk": "RH DLSS5 Frame Interpolation (Disk)",
 }
