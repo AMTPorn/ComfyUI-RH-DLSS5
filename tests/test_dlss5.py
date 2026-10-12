@@ -126,7 +126,7 @@ def test_sequential_source_monotonic(tmp_path):
 def test_stream_from_source_matches_array_path(monkeypatch):
     calls = []
 
-    def fake_prepare(src_fps, width, height, count, runtime_dir):
+    def fake_prepare(src_fps, width, height, count, runtime_dir, wine_prefix=""):
         calls.append(("prepare", count, width, height))
         return "runtime", src_fps
 

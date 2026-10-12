@@ -136,15 +136,41 @@ def find_fg_runtime(override: str = "") -> Path:
 _PROBE_CACHE: dict[str, tuple[float, dict]] = {}
 
 
-def probe_fg_capabilities(runtime: Path) -> dict:
+def _kill_session(proc: subprocess.Popen) -> None:
+    try:
+        if platform.system() == "Windows":
+            proc.kill()
+        else:
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
+    for stream in (proc.stdout, proc.stderr):
+        try:
+            if stream:
+                stream.close()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def probe_fg_capabilities(runtime: Path, wine_prefix: str = "") -> dict:
     """Run the worker's --probe capability query (cached per directory+mtime)."""
-    key = str(runtime)
+    env = _worker_env(runtime)
+    # Same prefix as FGSession: without it wine falls back to ~/.wine, which on a
+    # fresh container means a first-run wineboot whose Mono install dialog never
+    # returns headless, hanging the probe (and the prompt) forever.
+    if platform.system() != "Windows":
+        env["WINEPREFIX"] = resolve_wine_prefix(wine_prefix)
+    key = (str(runtime), env.get("WINEPREFIX", ""))
     stamp = max((runtime / name).stat().st_mtime for name in RUNTIME_FILES)
     cached = _PROBE_CACHE.get(key)
     if cached and cached[0] == stamp:
         return cached[1]
 
-    env = _worker_env(runtime)
     proc = subprocess.Popen(
         _worker_command(runtime, "--probe"),
         cwd=str(runtime), env=env,
@@ -154,8 +180,9 @@ def probe_fg_capabilities(runtime: Path) -> dict:
     try:
         stdout, stderr = proc.communicate(timeout=120)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
+        # Kill the whole session: wine helpers (wineserver, explorer) inherit the
+        # pipes, so killing only the launcher leaves communicate() blocked.
+        _kill_session(proc)
         raise DLSS5Error("DLSS frame generation capability probe timed out.")
     if proc.returncode:
         detail = (stderr or stdout).strip() or f"exit code {proc.returncode}"
@@ -456,12 +483,13 @@ def _pick_indices(grid_count: int, grid_rate: Fraction, target_rate: Fraction) -
     return indices
 
 
-def _prepare(src_fps, width: int, height: int, frames_count: int, runtime_dir: str):
+def _prepare(src_fps, width: int, height: int, frames_count: int, runtime_dir: str,
+             wine_prefix: str = ""):
     """Shared validation + runtime/probe gate for both interpolation entry points."""
     if frames_count < 2:
         raise DLSS5Error("DLSS frame interpolation needs at least 2 frames.")
     runtime = find_fg_runtime(runtime_dir)
-    probe = probe_fg_capabilities(runtime)
+    probe = probe_fg_capabilities(runtime, wine_prefix)
     if not probe.get("available"):
         raise DLSS5Error(f"DLSS frame generation is not available on this machine: "
                          f"{probe.get('detail') or probe}")
@@ -560,7 +588,7 @@ def interpolate_frames(images: torch.Tensor, src_fps, multiplier: int, motion_mo
         raise DLSS5Error("DLSS frame interpolation expects (T, H, W, 3) frames.")
     count, height, width, _ = images.shape
     stages, out_fps, _ = _plan(src_fps, multiplier, target_fps)
-    runtime, src_fps = _prepare(src_fps, width, height, count, runtime_dir)
+    runtime, src_fps = _prepare(src_fps, width, height, count, runtime_dir, wine_prefix)
     out_count = int((count - 1) * out_fps / src_fps) + 1
     result = torch.empty((out_count, height, width, 3), dtype=torch.float32)
     engines = []
@@ -592,7 +620,7 @@ def interpolate_stream_from_source(sources, count: int, width: int, height: int,
     if frame_sink is None:
         raise DLSS5Error("interpolate_stream needs a frame_sink callable.")
     stages, out_fps, _ = _plan(src_fps, multiplier, target_fps)
-    runtime, src_fps = _prepare(src_fps, width, height, count, runtime_dir)
+    runtime, src_fps = _prepare(src_fps, width, height, count, runtime_dir, wine_prefix)
     engines = []
     frames = _sampled_frames(sources, count, runtime, src_fps, stages,
                              out_fps, wine_prefix, scene_threshold, motion_mode,
